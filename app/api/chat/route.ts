@@ -42,10 +42,6 @@ export async function POST(request: NextRequest) {
   console.log('🚀 [API] Chat request received');
   console.log('⏱️  [API] Request start time:', new Date(requestStartTime).toISOString());
 
-  // Get waitUntil from NextRequest context (Vercel Edge/Serverless feature)
-  // @ts-ignore - waitUntil may not be in types yet
-  const waitUntil = request.waitUntil?.bind(request);
-
   // Initialiseer variabelen
   let message: string = '';
   let conversationHistory: any[] = [];
@@ -220,11 +216,107 @@ export async function POST(request: NextRequest) {
           }
 
           streamComplete = true;
+
+          // ========================================
+          // CRITICAL FIX: Update Supabase BEFORE closing stream
+          // Dit voorkomt dat logs blijven steken op "[Streaming in progress...]"
+          // ========================================
+          const requestEndTime = Date.now();
+          const responseTimeMs = requestEndTime - requestStartTime;
+          const responseTimeSeconds = parseFloat((responseTimeMs / 1000).toFixed(2));
+
+          console.log('\n⏱️  [API] ========== TIMING ==========');
+          console.log('⏱️  [API] Total response time:', responseTimeSeconds, 'seconds');
+
+          if (logId && finalUsage && fullAnswer) {
+            const totalCost = parseFloat(pineconeCost.toFixed(6)) + (finalUsage.totalCost || 0);
+
+            console.log('🔄 [API] Updating Supabase log with final data (with retry)...');
+            try {
+              const result = await updateChatRequestWithRetry(logId, {
+                answer: fullAnswer,
+                response_time_seconds: responseTimeSeconds,
+                response_time_ms: responseTimeMs,
+                openai_input_tokens: finalUsage.inputTokens || 0,
+                openai_output_tokens: finalUsage.outputTokens || 0,
+                openai_total_tokens: finalUsage.totalTokens || 0,
+                openai_cost: finalUsage.totalCost || 0,
+                total_cost: totalCost
+              }, 3);
+
+              if (result.success) {
+                console.log(`✅ [API] Supabase log updated successfully (${result.attempts} attempt(s))`);
+              } else {
+                console.error(`❌ [API] Failed to update Supabase log after ${result.attempts} attempts:`, result.error);
+              }
+            } catch (err) {
+              console.error('⚠️ [API] Error updating Supabase log:', err);
+            }
+          } else if (logId) {
+            // Incomplete data - still update to avoid "[Streaming in progress...]"
+            console.warn('⚠️ [API] Incomplete streaming data:', {
+              hasUsage: !!finalUsage,
+              hasAnswer: !!fullAnswer,
+              answerLength: fullAnswer.length
+            });
+
+            try {
+              console.log('🔄 [API] Updating Supabase log with incomplete data...');
+              const result = await updateChatRequestWithRetry(logId, {
+                answer: fullAnswer || '[ERROR]: No answer received from OpenAI',
+                response_time_seconds: responseTimeSeconds,
+                response_time_ms: responseTimeMs,
+                openai_input_tokens: finalUsage?.inputTokens || 0,
+                openai_output_tokens: finalUsage?.outputTokens || 0,
+                openai_total_tokens: finalUsage?.totalTokens || 0,
+                openai_cost: finalUsage?.totalCost || 0,
+                total_cost: parseFloat(pineconeCost.toFixed(6)) + (finalUsage?.totalCost || 0)
+              }, 3);
+
+              if (result.success) {
+                console.log(`✅ [API] Incomplete log updated (${result.attempts} attempt(s))`);
+              } else {
+                console.error(`❌ [API] Failed to update incomplete log after ${result.attempts} attempts:`, result.error);
+              }
+            } catch (err) {
+              console.error('⚠️ [API] Error updating incomplete log:', err);
+            }
+          }
+
           controller.close();
         } catch (error) {
           console.error('❌ [API] Streaming error:', error);
           streamError = error instanceof Error ? error : new Error('Unknown streaming error');
           streamComplete = true;
+
+          // Update Supabase log with error BEFORE closing
+          const requestEndTime = Date.now();
+          const responseTimeMs = requestEndTime - requestStartTime;
+          const responseTimeSeconds = parseFloat((responseTimeMs / 1000).toFixed(2));
+
+          if (logId) {
+            console.log('🔄 [API] Updating Supabase log with streaming error...');
+            try {
+              const result = await updateChatRequestWithRetry(logId, {
+                answer: `[STREAMING ERROR]: ${streamError.message}`,
+                response_time_seconds: responseTimeSeconds,
+                response_time_ms: responseTimeMs,
+                openai_input_tokens: 0,
+                openai_output_tokens: 0,
+                openai_total_tokens: 0,
+                openai_cost: 0,
+                total_cost: parseFloat(pineconeCost.toFixed(6))
+              }, 3);
+
+              if (result.success) {
+                console.log(`✅ [API] Error log updated (${result.attempts} attempt(s))`);
+              } else {
+                console.error(`❌ [API] Failed to update error log after ${result.attempts} attempts:`, result.error);
+              }
+            } catch (err) {
+              console.error('⚠️ [API] Error updating error log:', err);
+            }
+          }
 
           const errorEvent = JSON.stringify({
             type: 'error',
@@ -236,128 +328,7 @@ export async function POST(request: NextRequest) {
       }
     });
 
-    // ========================================
-    // CRITICAL FIX: Gebruik waitUntil (Vercel) of schedule update AFTER response
-    // Dit garandeert dat de Supabase update uitgevoerd wordt, ook na stream close
-    // ========================================
-    const performSupabaseUpdate = async () => {
-      // Wacht tot stream compleet is (max 30 seconden)
-      const maxWaitTime = 30000;
-      const startWait = Date.now();
-
-      while (!streamComplete && (Date.now() - startWait) < maxWaitTime) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-
-      // Bereken timing
-      const requestEndTime = Date.now();
-      const responseTimeMs = requestEndTime - requestStartTime;
-      const responseTimeSeconds = parseFloat((responseTimeMs / 1000).toFixed(2));
-
-      console.log('\n⏱️  [API] ========== TIMING ==========');
-      console.log('⏱️  [API] Total response time:', responseTimeSeconds, 'seconds');
-      console.log('⏱️  [API] Stream complete:', streamComplete);
-
-      if (!logId) {
-        console.error('❌ [API] No logId available for Supabase update');
-        return;
-      }
-
-      // Check if we had a streaming error
-      if (streamError) {
-        console.log('🔄 [API] Updating Supabase log with streaming error...');
-        try {
-          const result = await updateChatRequestWithRetry(logId, {
-            answer: `[STREAMING ERROR]: ${streamError.message}`,
-            response_time_seconds: responseTimeSeconds,
-            response_time_ms: responseTimeMs,
-            openai_input_tokens: 0,
-            openai_output_tokens: 0,
-            openai_total_tokens: 0,
-            openai_cost: 0,
-            total_cost: parseFloat(pineconeCost.toFixed(6))
-          }, 3);
-
-          if (result.success) {
-            console.log(`✅ [API] Error log updated (${result.attempts} attempt(s))`);
-          } else {
-            console.error(`❌ [API] Failed to update error log after ${result.attempts} attempts:`, result.error);
-          }
-        } catch (err) {
-          console.error('⚠️ [API] Error updating error log:', err);
-        }
-        return;
-      }
-
-      // Normal completion - update with full data
-      if (finalUsage && fullAnswer) {
-        const totalCost = parseFloat(pineconeCost.toFixed(6)) + (finalUsage.totalCost || 0);
-
-        console.log('🔄 [API] Updating Supabase log with final data (with retry)...');
-        try {
-          const result = await updateChatRequestWithRetry(logId, {
-            answer: fullAnswer,
-            response_time_seconds: responseTimeSeconds,
-            response_time_ms: responseTimeMs,
-            openai_input_tokens: finalUsage.inputTokens || 0,
-            openai_output_tokens: finalUsage.outputTokens || 0,
-            openai_total_tokens: finalUsage.totalTokens || 0,
-            openai_cost: finalUsage.totalCost || 0,
-            total_cost: totalCost
-          }, 3);
-
-          if (result.success) {
-            console.log(`✅ [API] Supabase log updated successfully (${result.attempts} attempt(s))`);
-          } else {
-            console.error(`❌ [API] Failed to update Supabase log after ${result.attempts} attempts:`, result.error);
-          }
-        } catch (err) {
-          console.error('⚠️ [API] Error updating Supabase log:', err);
-        }
-      } else {
-        // Incomplete data - still update to avoid "[Streaming in progress...]"
-        console.warn('⚠️ [API] Incomplete streaming data:', {
-          hasUsage: !!finalUsage,
-          hasAnswer: !!fullAnswer,
-          answerLength: fullAnswer.length
-        });
-
-        try {
-          console.log('🔄 [API] Updating Supabase log with incomplete data...');
-          const result = await updateChatRequestWithRetry(logId, {
-            answer: fullAnswer || '[ERROR]: No answer received from OpenAI',
-            response_time_seconds: responseTimeSeconds,
-            response_time_ms: responseTimeMs,
-            openai_input_tokens: finalUsage?.inputTokens || 0,
-            openai_output_tokens: finalUsage?.outputTokens || 0,
-            openai_total_tokens: finalUsage?.totalTokens || 0,
-            openai_cost: finalUsage?.totalCost || 0,
-            total_cost: parseFloat(pineconeCost.toFixed(6)) + (finalUsage?.totalCost || 0)
-          }, 3);
-
-          if (result.success) {
-            console.log(`✅ [API] Incomplete log updated (${result.attempts} attempt(s))`);
-          } else {
-            console.error(`❌ [API] Failed to update incomplete log after ${result.attempts} attempts:`, result.error);
-          }
-        } catch (err) {
-          console.error('⚠️ [API] Error updating incomplete log:', err);
-        }
-      }
-    };
-
-    // Use waitUntil if available (Vercel), otherwise run in background (best effort)
-    if (waitUntil) {
-      console.log('✅ [API] Using waitUntil for guaranteed Supabase update');
-      waitUntil(performSupabaseUpdate());
-    } else {
-      console.log('⚠️ [API] waitUntil not available, running update in background (best effort)');
-      performSupabaseUpdate().catch(err => {
-        console.error('❌ [API] Background update failed:', err);
-      });
-    }
-
-    // Return streaming response
+    // Return streaming response (Supabase update now happens INSIDE stream)
     return new Response(transformedStream, {
       headers: {
         'Content-Type': 'text/event-stream',

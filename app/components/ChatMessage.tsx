@@ -1,6 +1,7 @@
 'use client';
 
 import { getPdfUrl, isPdfAvailable } from '@/lib/pdf-urls';
+import FeedbackButtons from './FeedbackButtons';
 
 interface ChatMessageProps {
   role: "user" | "assistant";
@@ -115,10 +116,10 @@ export const ChatMessage = ({ role, content, citations, logId }: ChatMessageProp
             </div>
           )}
 
-          {/* Feedback buttons - TODO: Implementeer feedback functionaliteit */}
-          {/* {!isUser && (
+          {/* Feedback buttons */}
+          {!isUser && (
             <FeedbackButtons logId={logId || null} />
-          )} */}
+          )}
         </div>
       </div>
     </div>
